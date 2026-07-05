@@ -3,41 +3,6 @@
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
 
-// ──────────────────────── 加群弹窗 ────────────────────────
-
-function showWelcomeModal() {
-  const WELCOME_KEY = "dangomiao_welcome_shown";
-  // 检查本次浏览器会话是否已显示过（刷新页面不弹，关闭标签页后重开会弹）
-  if (sessionStorage.getItem(WELCOME_KEY)) return;
-
-  // 显示弹窗
-  setTimeout(() => {
-    $("#welcomeModal").classList.remove("hidden");
-  }, 500); // 延迟 500ms 显示，更自然
-}
-
-function closeWelcome() {
-  $("#welcomeModal").classList.add("hidden");
-  // 记录本次会话已显示，刷新页面不再弹出
-  sessionStorage.setItem("dangomiao_welcome_shown", "1");
-}
-
-function joinGroup() {
-  // 这里可以配置群链接，如果是 QQ 群可以用 mqqapi
-  const groupNumber = "259844673"; // AI交流群
-  const qqGroupUrl = `mqqapi://card/show_pslcard?src_type=internal&version=1&uin=${groupNumber}&card_type=group&source=qrcode`;
-
-  // 尝试打开 QQ 群链接
-  window.open(qqGroupUrl, "_blank");
-
-  // 如果 QQ 打不开，提供备用方案
-  setTimeout(() => {
-    alert(`如果无法自动跳转，请手动添加 QQ 群：${groupNumber}`);
-  }, 1000);
-
-  closeWelcome();
-}
-
 // ──────────────────────── 工具 ────────────────────────
 
 async function api(path, opts = {}) {
@@ -1654,6 +1619,3 @@ refreshStats();
 refreshPool();
 _connectAutoStream();
 setInterval(refreshStats, 5000);
-
-// 显示加群弹窗（仅首次访问）
-showWelcomeModal();
