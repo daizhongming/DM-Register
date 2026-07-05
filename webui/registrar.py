@@ -16,7 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Optional
 
-ROOT = Path(__file__).resolve().parents[1]  # gpt-outlook-register/
+ROOT = Path(__file__).resolve().parents[1]  # repo root
 sys.path.insert(0, str(ROOT))
 
 from config import Config  # noqa: E402

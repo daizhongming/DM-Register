@@ -1,4 +1,4 @@
-# ChatGPT 注册（纯协议 + Outlook 邮箱版）—— 最小化提取包
+# DM Register
 
 **完全无浏览器**：用 `curl_cffi` 模拟 TLS 指纹 + 纯 Python/QuickJS 解 OpenAI Sentinel PoW + IMAP XOAUTH2 取 OTP，直接走 OpenAI authorize 状态机。
 
@@ -33,8 +33,8 @@
 
 #### 全新安装
 ```bash
-git clone https://github.com/Regert888/gpt-outlook-register.git
-cd gpt-outlook-register
+git clone <your-repo-url> dm-register
+cd dm-register
 pip install -r requirements.txt
 python start_webui.py
 # 浏览器自动打开 http://127.0.0.1:8765/
@@ -86,7 +86,7 @@ screen -ls
 
 #### 已有项目，安全升级（不丢数据）
 ```bash
-cd gpt-outlook-register
+cd dm-register
 
 # 1. 🔴 备份数据库（重要！）
 cp webui/webui.db webui/webui.db.backup

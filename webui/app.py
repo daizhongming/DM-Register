@@ -43,7 +43,7 @@ logger = logging.getLogger("webui")
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
 
-app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
+app = FastAPI(title="DM Register WebUI", docs_url=None, redoc_url=None)
 
 
 # ──────────────────────── Pydantic 模型 ────────────────────────

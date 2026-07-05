@@ -1,4 +1,4 @@
-// 团子喵的 WebUI 交互逻辑 ~
+// DM Register WebUI interaction logic.
 
 const $ = (s) => document.querySelector(s);
 const $$ = (s) => document.querySelectorAll(s);
@@ -1040,7 +1040,8 @@ $("#alertBannerClose").addEventListener("click", () => {
 
 // ──────────────────────── 表单持久化（localStorage 自动保存/恢复）────────────────────────
 
-const FORM_KEY = "gpt_outlook_register_form_v1";
+const FORM_KEY = "dm_register_form_v1";
+const OLD_FORM_KEY = "gpt_outlook_register_form_v1";
 
 // id -> 类型（默认 text；checkbox 走 .checked）
 const PERSIST_FIELDS = {
@@ -1063,7 +1064,14 @@ function _saveForm() {
 
 function _loadForm() {
   let data = {};
-  try { data = JSON.parse(localStorage.getItem(FORM_KEY) || "{}"); } catch (_) { data = {}; }
+  try {
+    let raw = localStorage.getItem(FORM_KEY);
+    if (!raw) {
+      raw = localStorage.getItem(OLD_FORM_KEY);
+      if (raw) localStorage.setItem(FORM_KEY, raw);
+    }
+    data = JSON.parse(raw || "{}");
+  } catch (_) { data = {}; }
   for (const [id, kind] of Object.entries(PERSIST_FIELDS)) {
     if (!(id in data)) continue;
     const el = document.getElementById(id);
