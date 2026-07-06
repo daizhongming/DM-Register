@@ -25,6 +25,7 @@ sys.path.insert(0, str(ROOT))
 
 from . import db, registrar  # noqa: E402
 from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
+from openai_mfa import MFA_SETTINGS_URL, launch_mfa_setup_browser  # noqa: E402
 
 # 启动时自动释放卡死的 in_use 号（上次进程崩溃 / 强退留下的）
 try:
@@ -61,6 +62,7 @@ class RegisterReq(BaseModel):
     proxy: str = ""
     otp_timeout: int = 180
     allow_existing_login: bool = True
+    enable_openai_2fa: bool = False
 
 
 class Sub2apiReauthReq(BaseModel):
@@ -75,6 +77,15 @@ class Sub2apiReauthReq(BaseModel):
 
 class Sub2apiBulkDeleteReq(BaseModel):
     account_ids: list[int] = Field(default_factory=list)
+    account_emails: dict[int, str] = Field(default_factory=dict)
+
+
+class K12JoinRegisteredReq(BaseModel):
+    emails: Optional[list[str]] = None
+    all: bool = False
+    proxy: str = ""
+    limit: int = Field(5000, ge=1, le=20000)
+    concurrency: int = Field(3, ge=1, le=20)
 
 
 # ──────────────────────── API ────────────────────────
@@ -192,6 +203,7 @@ def api_register(req: RegisterReq):
         "proxy": req.proxy,
         "otp_timeout": int(req.otp_timeout),
         "allow_existing_login": req.allow_existing_login,
+        "enable_openai_2fa": bool(req.enable_openai_2fa),
     }
     run_id = registrar.start_registration(account, options)
     logger.info(f"[run] {run_id} -> {account['email']} (mail_source={mail_source})")
@@ -205,6 +217,24 @@ def api_sub2api_reauth_401(req: Sub2apiReauthReq):
     return {"ok": True, "run_id": run_id}
 
 
+@app.post("/api/k12/join_registered")
+def api_k12_join_registered(req: K12JoinRegisteredReq):
+    if not req.all and not req.emails:
+        raise HTTPException(400, "emails or all=true is required")
+    if db.get_setting("k12_enabled", "0") != "1":
+        raise HTTPException(400, "K12 join is disabled")
+    workspace_ids = [
+        line.strip()
+        for line in db.get_setting("k12_workspace_ids", "").splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not workspace_ids:
+        raise HTTPException(400, "No K12 workspace IDs configured")
+    run_id = registrar.start_k12_registered_join(req.model_dump())
+    logger.info(f"[run] {run_id} -> k12 registered join")
+    return {"ok": True, "run_id": run_id}
+
+
 @app.post("/api/sub2api/accounts/bulk_delete")
 def api_sub2api_bulk_delete(req: Sub2apiBulkDeleteReq):
     if not req.account_ids:
@@ -214,7 +244,7 @@ def api_sub2api_bulk_delete(req: Sub2apiBulkDeleteReq):
     from . import sub2api_reauth
 
     try:
-        result = sub2api_reauth.delete_sub2api_accounts(req.account_ids)
+        result = sub2api_reauth.delete_sub2api_accounts(req.account_ids, account_emails=req.account_emails)
     except RuntimeError as e:
         raise HTTPException(400, str(e))
     return {"ok": True, **result}
@@ -302,6 +332,17 @@ class BulkDeleteRegisteredReq(BaseModel):
     all: bool = False
 
 
+class OpenAITotpReq(BaseModel):
+    secret: str = ""
+    recovery_codes: str = ""
+    status: str = "totp_secret_saved"
+
+
+class OpenAIMfaBrowserReq(BaseModel):
+    url: str = MFA_SETTINGS_URL
+    proxy: str = ""
+
+
 @app.post("/api/registered/bulk_delete")
 def api_bulk_delete_registered(req: BulkDeleteRegisteredReq):
     if req.all:
@@ -311,6 +352,47 @@ def api_bulk_delete_registered(req: BulkDeleteRegisteredReq):
         n = db.delete_registered_by_emails(req.emails)
         return {"ok": True, "deleted": n, "by": "emails"}
     raise HTTPException(400, "需要 emails 或 all=true")
+
+
+@app.post("/api/registered/{email}/openai_totp")
+def api_save_openai_totp(email: str, req: OpenAITotpReq):
+    if not db.get_registered(email):
+        raise HTTPException(404, "not found")
+    try:
+        resources = db.save_openai_totp(email, req.secret, req.recovery_codes, req.status)
+        capability = db.describe_reauth_capability(email, ignore_registered_rt=True)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {
+        "ok": True,
+        "auth_resources": capability.get("auth_resources") or resources,
+        "capability": capability,
+    }
+
+
+@app.post("/api/registered/{email}/openai_totp/code")
+def api_openai_totp_code(email: str):
+    from totp_utils import totp_code
+
+    if not db.get_registered(email):
+        raise HTTPException(404, "not found")
+    resources = db.get_auth_resources(email)
+    secret = (resources.get("openai_totp_secret") or "").strip()
+    if not secret:
+        raise HTTPException(400, "missing openai_totp_secret")
+    return {"ok": True, "code": totp_code(secret), "period": 30}
+
+
+@app.post("/api/registered/{email}/openai_mfa_setup_browser")
+def api_openai_mfa_setup_browser(email: str, req: OpenAIMfaBrowserReq):
+    cred = db.get_registered(email)
+    if not cred:
+        raise HTTPException(404, "not found")
+    try:
+        result = launch_mfa_setup_browser(cred, email, root=ROOT, proxy=req.proxy, url=req.url)
+    except Exception as e:
+        raise HTTPException(500, f"failed to launch Playwright: {e}")
+    return {"ok": True, **result}
 
 
 # ──────────────────────── 邮箱来源配置 ────────────────────────
@@ -666,6 +748,27 @@ def api_save_k12_config(req: SaveK12ConfigReq):
     }
 
 
+@app.post("/api/settings/k12/usable/clear")
+def api_clear_k12_usable_workspaces():
+    empty = json.dumps({source: [] for source in db.MAIL_SOURCES}, ensure_ascii=False)
+    db.set_setting(db.K12_USABLE_WORKSPACES_KEY, empty)
+    db.set_setting(db.K12_WORKSPACE_FAILURES_KEY, "{}")
+    try:
+        from .k12_joiner import K12_LAST_RESULT_KEY
+
+        db.set_setting(K12_LAST_RESULT_KEY, "{}")
+    except Exception:
+        pass
+    return {
+        "ok": True,
+        "config": {
+            "k12_enabled": db.get_setting("k12_enabled", "0"),
+            "k12_workspace_ids": db.get_setting("k12_workspace_ids", ""),
+            "k12_usable_workspace_ids_by_mail_source": db.get_k12_usable_workspace_ids_by_mail_source(),
+        },
+    }
+
+
 @app.post("/api/settings/k12/test")
 def api_test_k12():
     """测试 K12 workspace 连通性：尝试用一个 dummy token 访问 workspace API。"""
@@ -725,6 +828,7 @@ class AutoLoopStartReq(BaseModel):
     concurrency: int = 1         # 并发 worker 数（1-20）
     otp_timeout: int = 180
     allow_existing_login: bool = True
+    enable_openai_2fa: bool = False
     cool_down_seconds: float = 3.0  # 每个 worker 跑完后冷却（防风控）
 
 

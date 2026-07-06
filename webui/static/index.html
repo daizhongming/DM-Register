@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>DM Register WebUI</title>
-<link rel="stylesheet" href="/static/style.css?v=k12-usable-1">
+<link rel="stylesheet" href="/static/style.css?v=k12-usable-3">
 </head>
 <body>
 
@@ -53,6 +53,10 @@
       </label>
       <label>OTP 等待秒数
         <input id="regOtpTimeout" type="number" value="180" min="30" max="600">
+      </label>
+      <label class="check inline-check">
+        <input type="checkbox" id="regEnable2fa">
+        注册后开启 ChatGPT 2FA
       </label>
 
       <div class="row">
@@ -151,6 +155,7 @@
           <input type="radio" name="regFilter" value="no_rt"> 无 RT
         </label>
         <button id="btnDeleteSelectedReg" title="删除已勾选的凭证" disabled>🗑️ 删除选中 (<span id="selCountReg">0</span>)</button>
+        <button id="btnJoinK12SelectedReg" title="让选中的已注册账号加入当前 K12 Workspace IDs" disabled>补加入 K12 (<span id="selCountK12Reg">0</span>)</button>
         <button id="btnDeleteAllReg" title="清空所有注册结果（危险）">💥 清空全部</button>
         <span id="exportResult" class="result"></span>
       </div>
@@ -203,7 +208,7 @@
           </div>
           <table id="sub2apiScanTable">
             <thead>
-              <tr><th>ID</th><th>邮箱</th><th>异常原因</th><th>授权结果</th><th>邮箱接码</th><th>PayMesh卡</th><th>本地RT</th><th>手机号记录</th><th>短信可用</th><th>自动授权判定</th><th>阻断原因</th></tr>
+              <tr><th>ID</th><th>邮箱</th><th>异常原因</th><th>授权结果</th><th>邮箱接码</th><th>PayMesh卡</th><th>本地RT</th><th>TOTP</th><th>手机号记录</th><th>短信可用</th><th>自动授权判定</th><th>阻断原因</th></tr>
             </thead>
             <tbody></tbody>
           </table>
@@ -458,15 +463,19 @@
             <textarea id="k12WorkspaceIds" rows="5" placeholder="acfb4e38-524c-4dc8-b4cf-fb3d0ce28b25&#10;# 这是注释行，会被忽略&#10;另一个workspace-id"></textarea>
           </label>
 
+          <div class="k12-usable-head">
+            <span>可用 Workspace IDs 缓存</span>
+            <button id="btnClearK12Usable" type="button">清空可用缓存</button>
+          </div>
           <div class="k12-usable-grid">
-            <label>Outlook 可用 Workspace IDs <small id="k12UsableOutlookCount">0 个</small>
-              <textarea id="k12UsableOutlook" rows="3" readonly></textarea>
+            <label>Outlook <small id="k12UsableOutlookCount">0 个</small>
+              <textarea id="k12UsableOutlook" rows="4" readonly></textarea>
             </label>
-            <label>CF Temp 可用 Workspace IDs <small id="k12UsableCfTempCount">0 个</small>
-              <textarea id="k12UsableCfTemp" rows="3" readonly></textarea>
+            <label>CF Temp <small id="k12UsableCfTempCount">0 个</small>
+              <textarea id="k12UsableCfTemp" rows="4" readonly></textarea>
             </label>
-            <label>PayMesh 卡密邮箱可用 Workspace IDs <small id="k12UsablePaymeshCount">0 个</small>
-              <textarea id="k12UsablePaymesh" rows="3" readonly></textarea>
+            <label>PayMesh 卡密邮箱 <small id="k12UsablePaymeshCount">0 个</small>
+              <textarea id="k12UsablePaymesh" rows="4" readonly></textarea>
             </label>
           </div>
 
@@ -478,6 +487,7 @@
           <div class="row">
             <button id="btnTestK12">🔌 测试 Workspace ID 格式</button>
             <button id="btnDedupeK12">去重 Workspace IDs</button>
+            <button id="btnJoinK12Registered">让已注册账号补加入</button>
             <span id="k12TestResult" class="result"></span>
           </div>
         </fieldset>
@@ -504,6 +514,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=k12-usable-1"></script>
+<script src="/static/app.js?v=k12-usable-3"></script>
 </body>
 </html>

@@ -338,6 +338,91 @@ def test_reauthorize_one_falls_back_to_paymesh_after_rt_failure():
     assert calls["password"] == "saved-openai-password"
 
 
+def test_reauthorize_one_uses_totp_after_rt_failure():
+    access = _jwt({
+        "exp": 4102444800,
+        "https://api.openai.com/auth": {"chatgpt_account_id": "account"},
+    })
+    calls = {}
+
+    class FakeResult:
+        def to_dict(self):
+            return {
+                "access_token": access,
+                "refresh_token": "new-rt",
+                "id_token": "new-id",
+            }
+
+    class FakeFlow:
+        def __init__(self, cfg, sms_callback=None):
+            pass
+
+        def run_protocol_login(self, mail, email, password, totp_secret=""):
+            calls["mail"] = mail
+            calls["email"] = email
+            calls["password"] = password
+            calls["totp_secret"] = totp_secret
+            return FakeResult()
+
+    old_get_registered = sub2api_reauth.db.get_registered
+    old_describe = sub2api_reauth.db.describe_reauth_capability
+    old_get_auth_resources = sub2api_reauth.db.get_auth_resources
+    old_save_registered = sub2api_reauth.db.save_registered
+    old_upsert_auth_resources = sub2api_reauth.db.upsert_auth_resources
+    old_refresh = sub2api_reauth.exporter.refresh_codex_token
+    old_apply = sub2api_reauth._apply_fresh_credentials
+    old_flow = sub2api_reauth.AuthFlow
+    try:
+        sub2api_reauth.db.get_registered = lambda email: {
+            "email": email,
+            "password": "fixed-password",
+            "refresh_token": "bad-rt",
+        }
+        sub2api_reauth.exporter.refresh_codex_token = lambda rt: (_ for _ in ()).throw(RuntimeError("invalid_grant"))
+        sub2api_reauth.db.describe_reauth_capability = lambda email, ignore_registered_rt=False: {
+            "can_attempt_reauth": True,
+            "reauth_method_hint": "openai_totp_protocol_login",
+            "auth_resources": {"openai_totp_secret_set": True},
+            "blockers": [],
+            "sms_available": True,
+            "has_outlook": False,
+        }
+        sub2api_reauth.db.get_auth_resources = lambda email: {
+            "openai_totp_secret": "JBSWY3DPEHPK3PXP",
+        }
+        sub2api_reauth.db.save_registered = lambda d: None
+        sub2api_reauth.db.upsert_auth_resources = lambda email, **fields: None
+        sub2api_reauth._apply_fresh_credentials = lambda account, cfg, fresh, log_fn: {
+            "ok": True,
+            "account_id": account["id"],
+            "email": fresh["email"],
+        }
+        sub2api_reauth.AuthFlow = FakeFlow
+
+        result = sub2api_reauth._reauthorize_one(
+            {"id": 12, "extra": {"email": "user@example.com"}, "credentials": {}},
+            {"sub2api_url": "https://sub2api.test", "sub2api_api_key": "key"},
+            proxy="",
+            otp_timeout=30,
+            log_fn=None,
+            sms_callback=None,
+        )
+    finally:
+        sub2api_reauth.db.get_registered = old_get_registered
+        sub2api_reauth.db.describe_reauth_capability = old_describe
+        sub2api_reauth.db.get_auth_resources = old_get_auth_resources
+        sub2api_reauth.db.save_registered = old_save_registered
+        sub2api_reauth.db.upsert_auth_resources = old_upsert_auth_resources
+        sub2api_reauth.exporter.refresh_codex_token = old_refresh
+        sub2api_reauth._apply_fresh_credentials = old_apply
+        sub2api_reauth.AuthFlow = old_flow
+
+    assert result["method"] == "openai_totp_protocol_login"
+    assert isinstance(calls["mail"], sub2api_reauth.TotpOnlyMailProvider)
+    assert calls["password"] == "fixed-password"
+    assert calls["totp_secret"] == "JBSWY3DPEHPK3PXP"
+
+
 def test_dry_run_returns_all_candidates_not_limited_by_max_accounts():
     candidates = [
         {"account": {"id": 1, "extra": {"email": "one@example.com"}}, "reason": "401"},
@@ -435,6 +520,90 @@ def test_reauth_cancel_before_scan_returns_cancelled():
     assert result["results"] == []
 
 
+def test_delete_sub2api_accounts_cleans_local_artifacts_by_email():
+    deleted_paths = []
+    cleaned = []
+    old_cfg = sub2api_reauth._sub2api_cfg
+    old_list = sub2api_reauth.list_sub2api_openai_oauth_accounts
+    old_import_cffi = sub2api_reauth.exporter._import_cffi
+    old_delete = sub2api_reauth._sub2api_delete
+    old_cleanup = sub2api_reauth.db.delete_local_account_artifacts
+    try:
+        sub2api_reauth._sub2api_cfg = lambda: {
+            "sub2api_url": "https://sub2api.test",
+            "sub2api_api_key": "key",
+            "sub2api_timeout": "5",
+        }
+        sub2api_reauth.list_sub2api_openai_oauth_accounts = lambda cfg, *, scan_limit, log_fn: [
+            {"id": 7, "extra": {"email": "USER@example.com"}},
+        ]
+        sub2api_reauth.exporter._import_cffi = lambda: object()
+
+        def fake_delete(cffi, api_url, api_key, path, timeout):
+            deleted_paths.append(path)
+
+        def fake_cleanup(email):
+            cleaned.append(email)
+            return {"email": email, "deleted": 3}
+
+        sub2api_reauth._sub2api_delete = fake_delete
+        sub2api_reauth.db.delete_local_account_artifacts = fake_cleanup
+
+        result = sub2api_reauth.delete_sub2api_accounts([7])
+    finally:
+        sub2api_reauth._sub2api_cfg = old_cfg
+        sub2api_reauth.list_sub2api_openai_oauth_accounts = old_list
+        sub2api_reauth.exporter._import_cffi = old_import_cffi
+        sub2api_reauth._sub2api_delete = old_delete
+        sub2api_reauth.db.delete_local_account_artifacts = old_cleanup
+
+    assert deleted_paths == ["/admin/accounts/7"]
+    assert cleaned == ["user@example.com"]
+    assert result["deleted"] == 1
+    assert result["local_deleted"] == 1
+    assert result["local_artifacts_deleted"] == 3
+
+
+def test_delete_sub2api_accounts_uses_supplied_email_if_lookup_fails():
+    cleaned = []
+    old_cfg = sub2api_reauth._sub2api_cfg
+    old_list = sub2api_reauth.list_sub2api_openai_oauth_accounts
+    old_import_cffi = sub2api_reauth.exporter._import_cffi
+    old_delete = sub2api_reauth._sub2api_delete
+    old_cleanup = sub2api_reauth.db.delete_local_account_artifacts
+    try:
+        sub2api_reauth._sub2api_cfg = lambda: {
+            "sub2api_url": "https://sub2api.test",
+            "sub2api_api_key": "key",
+        }
+        sub2api_reauth.list_sub2api_openai_oauth_accounts = lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("list failed")
+        )
+        sub2api_reauth.exporter._import_cffi = lambda: object()
+        sub2api_reauth._sub2api_delete = lambda *args, **kwargs: None
+
+        def fake_cleanup(email):
+            cleaned.append(email)
+            return {"email": email, "deleted": 1}
+
+        sub2api_reauth.db.delete_local_account_artifacts = fake_cleanup
+
+        result = sub2api_reauth.delete_sub2api_accounts(
+            [7],
+            account_emails={7: "USER@example.com"},
+        )
+    finally:
+        sub2api_reauth._sub2api_cfg = old_cfg
+        sub2api_reauth.list_sub2api_openai_oauth_accounts = old_list
+        sub2api_reauth.exporter._import_cffi = old_import_cffi
+        sub2api_reauth._sub2api_delete = old_delete
+        sub2api_reauth.db.delete_local_account_artifacts = old_cleanup
+
+    assert cleaned == ["user@example.com"]
+    assert result["deleted"] == 1
+    assert result["local_failed"] == 0
+
+
 if __name__ == "__main__":
     test_looks_reauth_needed_from_error_and_temp_reason()
     test_looks_reauth_needed_skips_workspace_403()
@@ -443,6 +612,9 @@ if __name__ == "__main__":
     test_reauthorize_one_uses_authflow_password_not_outlook_password()
     test_reauthorize_one_uses_registered_refresh_before_outlook_login()
     test_reauthorize_one_falls_back_to_paymesh_after_rt_failure()
+    test_reauthorize_one_uses_totp_after_rt_failure()
     test_dry_run_returns_all_candidates_not_limited_by_max_accounts()
     test_reauth_only_selected_account_ids_override_max_accounts()
     test_reauth_cancel_before_scan_returns_cancelled()
+    test_delete_sub2api_accounts_cleans_local_artifacts_by_email()
+    test_delete_sub2api_accounts_uses_supplied_email_if_lookup_fails()

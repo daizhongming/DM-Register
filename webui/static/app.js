@@ -142,7 +142,7 @@ function ensureSub2apiScanResults() {
     </div>
     <table id="sub2apiScanTable">
       <thead>
-        <tr><th>ID</th><th>邮箱</th><th>异常原因</th><th>授权结果</th><th>邮箱接码</th><th>PayMesh卡</th><th>本地RT</th><th>手机号记录</th><th>短信可用</th><th>自动授权判定</th><th>阻断原因</th></tr>
+        <tr><th>ID</th><th>邮箱</th><th>异常原因</th><th>授权结果</th><th>邮箱接码</th><th>PayMesh卡</th><th>本地RT</th><th>TOTP</th><th>手机号记录</th><th>短信可用</th><th>自动授权判定</th><th>阻断原因</th></tr>
       </thead>
       <tbody></tbody>
     </table>
@@ -217,7 +217,7 @@ function renderSub2apiScanResults(items) {
   if (!rows.length) {
     const tr = document.createElement("tr");
     const td = document.createElement("td");
-    td.colSpan = 12;
+    td.colSpan = 13;
     td.className = "muted-cell";
     td.textContent = "未发现异常账号";
     tr.appendChild(td);
@@ -256,6 +256,7 @@ function renderSub2apiScanResults(items) {
     add(tr, res.mail_source || (r.has_outlook ? "outlook" : ""));
     add(tr, res.paymesh_card || "");
     add(tr, yesNo(r.has_registered_rt));
+    add(tr, res.openai_totp_secret_set ? "有" : "无");
     add(tr, res.phone_number || "");
     add(tr, yesNo(r.sms_available));
     add(tr, r.can_attempt_reauth === false ? "不可自动授权" : (r.reauth_method_hint || r.method || "可授权"));
@@ -329,25 +330,30 @@ if (sub2apiScanBox) {
     if (btn.id !== "btnSub2apiDeleteSelected") return;
     const ids = selectedSub2apiAccountIds();
     if (!ids.length) return;
-    if (!confirm(`确定删除选中的 ${ids.length} 个 SUB2API 账号？\n只删除已勾选的账号，不会删除本地凭据。`)) return;
+    if (!confirm(`确定删除选中的 ${ids.length} 个账号？\n会删除远端 SUB2API 账号，并清理本地注册结果、邮箱卡密、手机号、TOTP 和号池记录。`)) return;
 
     const result = $("#sub2apiDeleteResult");
     btn.disabled = true;
     if (result) result.textContent = "删除中...";
     try {
+      const accountEmails = {};
+      for (const id of ids) {
+        const row = sub2apiScanRows.find((x) => Number(x.account_id) === Number(id));
+        if (row?.email) accountEmails[id] = row.email;
+      }
       const r = await api("/api/sub2api/accounts/bulk_delete", {
         method: "POST",
-        body: JSON.stringify({ account_ids: ids }),
+        body: JSON.stringify({ account_ids: ids, account_emails: accountEmails }),
       });
-      const deleted = new Set((r.results || []).filter((x) => x.ok).map((x) => Number(x.account_id)));
+      const deleted = new Set((r.results || []).filter((x) => x.remote_deleted || x.ok).map((x) => Number(x.account_id)));
       if (deleted.size) {
         renderSub2apiScanResults(sub2apiScanRows.filter((x) => !deleted.has(Number(x.account_id))));
       }
       if (result) {
-        result.textContent = r.failed
-          ? `已删除 ${r.deleted} 个，失败 ${r.failed} 个`
-          : `已删除 ${r.deleted} 个`;
-        result.className = "result " + (r.failed ? "bad" : "ok");
+        result.textContent = r.failed || r.local_failed
+          ? `远端已删除 ${r.deleted} 个，远端失败 ${r.failed} 个，本地清理 ${r.local_deleted || 0} 个账号，清理失败 ${r.local_failed || 0} 个`
+          : `远端已删除 ${r.deleted} 个，本地清理 ${r.local_deleted || 0} 个账号`;
+        result.className = "result " + (r.failed || r.local_failed ? "bad" : "ok");
       }
     } catch (err) {
       if (result) {
@@ -372,6 +378,7 @@ $("#btnRun").addEventListener("click", async () => {
     email: email || null,
     proxy: $("#regProxy").value.trim(),
     otp_timeout: parseInt($("#regOtpTimeout").value || "180", 10),
+    enable_openai_2fa: $("#regEnable2fa").checked,
     want_access_token: true,
     want_session_token: true,
     want_refresh_token: true,
@@ -423,6 +430,24 @@ function streamRun(runId) {
         $("#sub2apiReauthResult").textContent = s;
         $("#sub2apiReauthResult").className = "result " + (d.cancelled ? "warn" : ((d.failed || 0) ? "bad" : "ok"));
         renderSub2apiScanResults(d.results || []);
+        logLine("[client] " + s, "evt");
+        return;
+      }
+      if (d.kind === "done" && d.task === "k12_registered_join") {
+        const s = d.cancelled
+          ? `K12 join cancelled: accounts=${d.total || 0}, joined=${d.workspace_joined || 0}`
+          : `K12 join done: accounts ok=${d.accounts_success || 0}, failed=${d.accounts_failed || 0}, skipped=${d.accounts_skipped || 0}, joined=${d.workspace_joined || 0}`;
+        $("#runStatus").innerHTML = `<span class="${d.cancelled || (d.accounts_failed || 0) ? "warn" : "ok"}">${s}</span>`;
+        const k12Result = $("#k12TestResult");
+        if (k12Result) {
+          k12Result.textContent = s;
+          k12Result.className = "result " + (d.cancelled ? "warn" : ((d.accounts_failed || 0) ? "bad" : "ok"));
+        }
+        const exportResult = $("#exportResult");
+        if (exportResult) {
+          exportResult.textContent = s;
+          exportResult.className = "result " + (d.cancelled ? "warn" : ((d.accounts_failed || 0) ? "bad" : "ok"));
+        }
         logLine("[client] " + s, "evt");
         return;
       }
@@ -693,6 +718,8 @@ async function refreshRegistered() {
       <td>${fmtTime(r.created_at)}</td>
       <td>
         <button data-act="view" data-email="${r.email}">查看凭证</button>
+        <button data-act="mfa-browser" data-email="${r.email}">打开2FA</button>
+        <button data-act="totp" data-email="${r.email}">2FA</button>
         <button data-act="del" data-email="${r.email}">删除</button>
       </td>
     `;
@@ -716,7 +743,9 @@ function _selectedRegEmails() {
 function _updateSelCountReg() {
   const n = _selectedRegEmails().length;
   $("#selCountReg").textContent = n;
+  $("#selCountK12Reg").textContent = n;
   $("#btnDeleteSelectedReg").disabled = n === 0;
+  $("#btnJoinK12SelectedReg").disabled = n === 0;
 }
 $("#regTable").addEventListener("change", (e) => {
   if (e.target.classList.contains("reg-check")) _updateSelCountReg();
@@ -790,6 +819,32 @@ async function _copyText(text, btn) {
   }
 }
 
+async function bindOpenAITotp(email) {
+  const secret = prompt("OpenAI Authenticator setup key / otpauth URI", "");
+  if (secret === null) return;
+  const cleanSecret = secret.trim();
+  if (!cleanSecret) return;
+  const recoveryCodes = prompt("Recovery codes (optional)", "") || "";
+  await api(`/api/registered/${encodeURIComponent(email)}/openai_totp`, {
+    method: "POST",
+    body: JSON.stringify({
+      secret: cleanSecret,
+      recovery_codes: recoveryCodes.trim(),
+      status: "totp_secret_saved",
+    }),
+  });
+  const r = await api(`/api/registered/${encodeURIComponent(email)}/openai_totp/code`, { method: "POST" });
+  alert(`2FA TOTP saved. Current code: ${r.code}`);
+}
+
+async function openMfaSetupBrowser(email) {
+  const r = await api(`/api/registered/${encodeURIComponent(email)}/openai_mfa_setup_browser`, {
+    method: "POST",
+    body: JSON.stringify({}),
+  });
+  alert(`已打开 ChatGPT 2FA 设置页，pid=${r.pid}`);
+}
+
 $("#regTable").addEventListener("click", async (e) => {
   const btn = e.target.closest("button");
   if (!btn) return;
@@ -814,6 +869,21 @@ $("#regTable").addEventListener("click", async (e) => {
       const cred = await _loadCred(email);
       _renderCredModal(email, cred);
     } catch (err) { alert("加载凭证失败: " + err.message); }
+  }
+
+  if (btn.dataset.act === "totp") {
+    try {
+      await bindOpenAITotp(email);
+      refreshRegistered();
+    } catch (err) { alert("2FA binding failed: " + err.message); }
+    return;
+  }
+
+  if (btn.dataset.act === "mfa-browser") {
+    try {
+      await openMfaSetupBrowser(email);
+    } catch (err) { alert("打开 2FA 页面失败: " + err.message); }
+    return;
   }
 
   // 「删除」单行删
@@ -937,6 +1007,7 @@ function _autoOptions() {
     proxy_pool: $("#autoProxyPool").value,
     concurrency: parseInt($("#autoConcurrency").value || "1", 10),
     otp_timeout: parseInt($("#regOtpTimeout").value || "180", 10),
+    enable_openai_2fa: $("#regEnable2fa").checked,
     want_access_token: true,
     want_session_token: true,
     want_refresh_token: true,
@@ -1047,6 +1118,7 @@ const OLD_FORM_KEY = "gpt_outlook_register_form_v1";
 const PERSIST_FIELDS = {
   regProxy:        "text",
   regOtpTimeout:   "text",
+  regEnable2fa:    "checkbox",
   autoCoolDown:    "text",
   autoConcurrency: "text",
   autoProxyPool:   "text",
@@ -1485,6 +1557,26 @@ function renderK12UsableWorkspaces(groups) {
   }
 }
 
+async function clearK12UsableWorkspaces() {
+  if (!confirm("清空可用 Workspace IDs 缓存和 K12 冷却记录？\n下次补加入会从上方 Workspace IDs 第一行重新尝试。")) return;
+  const btn = $("#btnClearK12Usable");
+  const result = $("#k12TestResult");
+  btn.disabled = true;
+  result.textContent = "clearing...";
+  result.className = "result";
+  try {
+    const { config } = await api("/api/settings/k12/usable/clear", { method: "POST" });
+    renderK12UsableWorkspaces(config.k12_usable_workspace_ids_by_mail_source || {});
+    result.textContent = "已清空可用缓存；下次会从第一条 Workspace ID 重新加入并分类";
+    result.className = "result ok";
+  } catch (e) {
+    result.textContent = "清空失败: " + e.message;
+    result.className = "result bad";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
 function dedupeK12WorkspaceIds() {
   const input = $("#k12WorkspaceIds");
   const result = $("#k12TestResult");
@@ -1511,6 +1603,7 @@ function dedupeK12WorkspaceIds() {
   result.className = "result ok";
 }
 
+$("#btnClearK12Usable").addEventListener("click", clearK12UsableWorkspaces);
 $("#btnDedupeK12").addEventListener("click", dedupeK12WorkspaceIds);
 
 $("#btnSaveExportCfg").addEventListener("click", async () => {
@@ -1625,6 +1718,66 @@ async function runSub2apiAccountCheck(e, dryRun, selectedOnly = false) {
 
 $("#btnSub2apiCheckAccounts").addEventListener("click", (e) => runSub2apiAccountCheck(e, true));
 $("#btnSub2apiReauth401").addEventListener("click", (e) => runSub2apiAccountCheck(e, false));
+
+async function saveK12ConfigOnly() {
+  await api("/api/settings/k12", {
+    method: "POST",
+    body: JSON.stringify({
+      k12_enabled: $("#k12Enabled").checked ? "1" : "0",
+      k12_workspace_ids: $("#k12WorkspaceIds").value.trim(),
+    }),
+  });
+}
+
+async function startK12RegisteredJoin(btn, emails = null) {
+  if (currentEs) {
+    alert("Another run is still streaming. Wait for it to finish first.");
+    return;
+  }
+  const selected = Array.isArray(emails) ? emails : [];
+  if (emails && !selected.length) return;
+  if (!emails && !confirm("让所有已注册账号加入当前 K12 Workspace IDs？")) return;
+
+  const resultEl = emails ? $("#exportResult") : $("#k12TestResult");
+  btn.disabled = true;
+  resultEl.textContent = "starting...";
+  resultEl.className = "result";
+  $("#logBox").innerHTML = "";
+  try {
+    if (!emails) await saveK12ConfigOnly();
+    const concurrency = Math.min(20, Math.max(1, parseInt($("#autoConcurrency").value || "3", 10) || 3));
+    const body = emails
+      ? { emails: selected, proxy: $("#regProxy").value.trim(), concurrency }
+      : { all: true, proxy: $("#regProxy").value.trim(), concurrency };
+    const r = await api("/api/k12/join_registered", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    const msg = `K12 join started: run_id=${r.run_id}${emails ? ` selected=${selected.length}` : ""} concurrency=${concurrency}`;
+    resultEl.textContent = msg;
+    resultEl.className = "result ok";
+    $("#runStatus").textContent = msg;
+    logLine("[client] " + msg, "evt");
+    streamRun(r.run_id);
+  } catch (err) {
+    resultEl.textContent = "failed: " + err.message;
+    resultEl.className = "result bad";
+  } finally {
+    btn.disabled = false;
+    _updateSelCountReg();
+  }
+}
+
+$("#btnJoinK12SelectedReg").addEventListener("click", (e) => {
+  const emails = _selectedRegEmails();
+  if (!emails.length) return;
+  if (!confirm(`让选中的 ${emails.length} 个已注册账号加入当前 K12 Workspace IDs？`)) return;
+  startK12RegisteredJoin(e.currentTarget, emails);
+});
+
+$("#btnJoinK12Registered").addEventListener("click", (e) => {
+  startK12RegisteredJoin(e.currentTarget, null);
+});
 
 $("#btnTestK12").addEventListener("click", async (e) => {
   const btn = e.currentTarget;

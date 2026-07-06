@@ -1166,6 +1166,14 @@ class PhoneCallbackController:
         self.activation: Optional[SmsActivation] = None
         self.completed = False
         self._verify_lock_acquired = False
+        self._preferred_activation_id = ""
+        self._preferred_phone_number = ""
+        self._preferred_activation_used = False
+
+    def set_preferred_activation(self, activation_id: str = "", phone_number: str = "") -> None:
+        self._preferred_activation_id = str(activation_id or "").strip()
+        self._preferred_phone_number = str(phone_number or "").strip()
+        self._preferred_activation_used = False
 
     def _provider(self) -> BaseSmsProvider:
         if self.provider is None:
@@ -1175,6 +1183,25 @@ class PhoneCallbackController:
     def get_phone(self) -> str:
         """阶段 1：租手机号（已带 +）。"""
         provider = self._provider()
+        if (
+            isinstance(provider, NexSmsProvider)
+            and not self._preferred_activation_used
+            and self._preferred_activation_id
+            and self._preferred_phone_number
+        ):
+            self._preferred_activation_used = True
+            self.activation = SmsActivation(
+                activation_id=self._preferred_activation_id,
+                phone_number=self._preferred_phone_number,
+                country=str(self.config.get("sms_country") or self.country or ""),
+                metadata={"reused": True, "preferred": True},
+            )
+            self.log(
+                f"✅ 优先复用历史 NexSMS 号码: {self.activation.phone_number} "
+                f"(activation_id={self.activation.activation_id})"
+            )
+            return self.activation.phone_number
+
         # 同号复用锁（SmsBower 系列才用，防止两个注册任务并发抢同一个 cache）
         if isinstance(provider, SmsBowerProvider) and not self._verify_lock_acquired:
             _SMS_VERIFY_LOCK.acquire()

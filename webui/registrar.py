@@ -13,6 +13,7 @@ import threading
 import time
 import traceback
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -30,6 +31,7 @@ from . import db  # noqa: E402
 _run_queues: dict[str, queue.Queue] = {}
 _cancelled_runs: set[str] = set()
 _lock = threading.Lock()
+_k12_export_lock = threading.Lock()
 
 LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
@@ -286,6 +288,25 @@ def _do_register(
         # 落库
         db.save_registered(d)
         _save_auth_resource_mapping(d.get("email", ""), mail_source, mail, sms_callback)
+        if options.get("enable_openai_2fa"):
+            try:
+                from openai_mfa import launch_mfa_setup_browser
+
+                mfa = launch_mfa_setup_browser(
+                    d,
+                    d.get("email", ""),
+                    root=ROOT,
+                    proxy=cfg.proxy or "",
+                )
+                db.upsert_auth_resources(d.get("email", ""), openai_mfa_status="setup_browser_opened")
+                msg = f"[mfa] opened ChatGPT Security page pid={mfa.get('pid')}"
+                logging.getLogger("registrar").info(msg)
+                _emit_status(run_id, "phase", {"phase": "mfa", "message": msg})
+            except Exception as e:
+                msg = f"[mfa] setup browser open failed: {e}"
+                logging.getLogger("registrar").warning(msg)
+                db.upsert_auth_resources(d.get("email", ""), openai_mfa_status=f"setup_open_failed: {e}"[:200])
+                _emit_status(run_id, "phase", {"phase": "mfa", "message": msg, "level": "warn"})
         # CF/PayMesh 模式下 account email 是虚拟占位，不操作 outlook 号池
         if mail_source == "paymesh_card":
             if hasattr(mail, "mark_done"):
@@ -604,7 +625,15 @@ def _try_export_joined_workspaces_to_sub2api(
         pass
 
 
-def _try_join_k12_workspaces(run_id: str, cred: dict, proxy: Optional[str], mail_source: str = "outlook") -> Optional[dict]:
+def _try_join_k12_workspaces(
+    run_id: str,
+    cred: dict,
+    proxy: Optional[str],
+    mail_source: str = "outlook",
+    *,
+    use_saved_usable: bool = True,
+    force_allow_personal: bool = False,
+) -> Optional[dict]:
     """注册完成后可选地加入 K12 Workspace。
 
     - 开关关闭时跳过（不发请求）
@@ -650,14 +679,14 @@ def _try_join_k12_workspaces(run_id: str, cred: dict, proxy: Optional[str], mail
 
     try:
         _log("开始 K12 Workspace 加入流程")
-        usable_workspace_ids = db.get_k12_usable_workspace_ids(mail_source)
+        usable_workspace_ids = db.get_k12_usable_workspace_ids(mail_source) if use_saved_usable else []
         if usable_workspace_ids:
             _log(f"using {len(usable_workspace_ids)} saved usable workspace id(s) for {mail_source}")
         result = k12_joiner.join_workspaces_from_config(
             access_token,
             proxy=proxy,
             session_token=session_token,
-            allow_personal_token=bool(cred.get("created_new") or cred.get("login_mode")),
+            allow_personal_token=force_allow_personal or bool(cred.get("created_new") or cred.get("login_mode")),
             workspace_ids_override=usable_workspace_ids or None,
         )
 
@@ -743,6 +772,210 @@ def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
     except Exception as e:
         smslog.warning(f"[sms] 创建接码 controller 失败: {e}")
         return None
+
+
+def _registered_k12_targets(options: dict) -> list[dict]:
+    emails = [
+        str(email or "").strip().lower()
+        for email in (options.get("emails") or [])
+        if str(email or "").strip()
+    ]
+    if emails:
+        out = []
+        for email in emails:
+            row = db.get_registered(email)
+            if row:
+                out.append(row)
+        return out
+    if not options.get("all"):
+        return []
+    try:
+        limit = max(1, int(options.get("limit") or 5000))
+    except Exception:
+        limit = 5000
+    return db.list_registered_full(limit=limit)
+
+
+def _registered_mail_source(email: str) -> str:
+    try:
+        resources = db.get_auth_resources(email)
+        source = str((resources or {}).get("mail_source") or "").strip()
+        if source:
+            return source
+    except Exception:
+        pass
+    return "outlook"
+
+
+def _refresh_cred_from_existing(cred: dict, proxy: Optional[str]) -> Optional[AuthFlow]:
+    if not (cred.get("session_token") or cred.get("access_token")):
+        return None
+    cfg = Config()
+    cfg.proxy = (proxy or "").strip() or None
+    flow = AuthFlow(cfg)
+    result = flow.from_existing_credentials(
+        cred.get("session_token", ""),
+        cred.get("access_token", ""),
+        cred.get("device_id", ""),
+    )
+    for key in ("email", "session_token", "access_token", "device_id", "cookie_header"):
+        value = getattr(result, key, "")
+        if value:
+            cred[key] = value
+    flow.result.email = cred.get("email", "")
+    flow.result.password = cred.get("password", "")
+    flow.result.refresh_token = cred.get("refresh_token", "")
+    flow.result.id_token = cred.get("id_token", "")
+    return flow
+
+
+def _do_k12_registered_join(run_id: str, options: dict, log_file: Path):
+    handler = QueueLogHandler(run_id, log_file)
+    handler.setLevel(logging.INFO)
+    root_logger = logging.getLogger()
+    root_logger.addHandler(handler)
+    if root_logger.level > logging.INFO or root_logger.level == 0:
+        root_logger.setLevel(logging.INFO)
+
+    log = logging.getLogger("registrar")
+    proxy = (options.get("proxy") or "").strip() or None
+    try:
+        concurrency = min(20, max(1, int(options.get("concurrency") or 3)))
+    except Exception:
+        concurrency = 3
+    summary = {
+        "task": "k12_registered_join",
+        "total": 0,
+        "concurrency": concurrency,
+        "accounts_success": 0,
+        "accounts_failed": 0,
+        "accounts_skipped": 0,
+        "workspace_joined": 0,
+        "workspace_failed": 0,
+        "workspace_skipped": 0,
+        "cancelled": False,
+    }
+
+    try:
+        rows = _registered_k12_targets(options)
+        summary["total"] = len(rows)
+        if not rows:
+            _emit_status(run_id, "done", summary)
+            db.finish_run(run_id, "done")
+            return
+
+        _emit_status(run_id, "phase", {
+            "phase": "k12_registered_join",
+            "message": f"starting {len(rows)} registered account(s)",
+        })
+        log.info("[k12-registered] starting %s account(s), concurrency=%s", len(rows), concurrency)
+
+        def _one(idx: int, cred: dict) -> dict:
+            if is_run_cancelled(run_id):
+                return {"cancelled": True}
+
+            email = str(cred.get("email") or "").strip().lower()
+            if not email:
+                return {"accounts_skipped": 1}
+            if not (cred.get("access_token") or cred.get("session_token")):
+                log.warning("[k12-registered] skip %s: no access/session token", email)
+                return {"accounts_skipped": 1}
+
+            mail_source = _registered_mail_source(email)
+            _emit_status(run_id, "phase", {
+                "phase": "k12_registered_join",
+                "message": f"{idx}/{len(rows)} {email}",
+            })
+            log.info("[k12-registered] %s/%s %s source=%s", idx, len(rows), email, mail_source)
+
+            flow = None
+            try:
+                flow = _refresh_cred_from_existing(cred, proxy)
+            except Exception as e:
+                log.warning("[k12-registered] refresh existing credential failed for %s: %s", email, e)
+
+            if not cred.get("access_token"):
+                log.warning("[k12-registered] skip %s: no access token after refresh", email)
+                return {"accounts_skipped": 1}
+
+            result = _try_join_k12_workspaces(
+                run_id,
+                cred,
+                proxy,
+                mail_source,
+                use_saved_usable=False,
+                force_allow_personal=True,
+            ) or {}
+            out = {
+                "workspace_joined": 0,
+                "workspace_failed": int(result.get("failed") or 0),
+                "workspace_skipped": int(result.get("skipped") or 0),
+            }
+            attempted = int(result.get("attempted") or 0)
+            joined_ids = [
+                str(ws_id).strip()
+                for ws_id in (result.get("joined_workspace_ids") or [])
+                if str(ws_id).strip()
+            ]
+            out["workspace_joined"] = len(joined_ids)
+
+            if joined_ids:
+                out["accounts_success"] = 1
+                with _k12_export_lock:
+                    _try_export_joined_workspaces_to_sub2api(
+                        run_id,
+                        cred,
+                        result,
+                        auth_flow=flow,
+                        mail_source=mail_source,
+                    )
+            elif attempted == 0 and out["workspace_skipped"]:
+                out["accounts_skipped"] = 1
+            else:
+                out["accounts_failed"] = 1
+            return out
+
+        with ThreadPoolExecutor(max_workers=concurrency, thread_name_prefix="k12-join") as executor:
+            futures = [executor.submit(_one, idx, dict(cred)) for idx, cred in enumerate(rows, 1)]
+            for fut in as_completed(futures):
+                if is_run_cancelled(run_id):
+                    summary["cancelled"] = True
+                    for pending in futures:
+                        pending.cancel()
+                    break
+                result = fut.result()
+                if result.get("cancelled"):
+                    summary["cancelled"] = True
+                    continue
+                for key in (
+                    "accounts_success",
+                    "accounts_failed",
+                    "accounts_skipped",
+                    "workspace_joined",
+                    "workspace_failed",
+                    "workspace_skipped",
+                ):
+                    summary[key] += int(result.get(key) or 0)
+
+        _emit_status(run_id, "done", summary)
+        db.finish_run(run_id, "cancelled" if summary["cancelled"] else "done")
+    except Exception as e:
+        err = str(e)
+        log.error("[k12-registered] failed: %s", err)
+        log.error(traceback.format_exc())
+        db.finish_run(run_id, "failed", err, category="unknown")
+        _emit_status(run_id, "error", {"message": err, "category": "unknown"})
+    finally:
+        try:
+            root_logger.removeHandler(handler)
+            handler.close()
+        except Exception:
+            pass
+        q = _run_queues.get(run_id)
+        if q is not None:
+            q.put(None)
+        with _lock:
+            _cancelled_runs.discard(run_id)
 
 
 def _do_sub2api_reauth(run_id: str, options: dict, log_file: Path):
@@ -841,6 +1074,26 @@ def start_sub2api_reauth(options: dict) -> str:
         args=(run_id, options, log_file),
         daemon=True,
         name=f"sub2api-reauth-{run_id}",
+    )
+    th.start()
+    return run_id
+
+
+def start_k12_registered_join(options: dict) -> str:
+    run_id = uuid.uuid4().hex[:12]
+    log_file = LOG_DIR / f"{run_id}.log"
+    db.create_run(run_id, "k12-registered-join@local", str(log_file))
+
+    q: queue.Queue = queue.Queue()
+    with _lock:
+        _cancelled_runs.discard(run_id)
+        _run_queues[run_id] = q
+
+    th = threading.Thread(
+        target=_do_k12_registered_join,
+        args=(run_id, options, log_file),
+        daemon=True,
+        name=f"k12-registered-join-{run_id}",
     )
     th.start()
     return run_id

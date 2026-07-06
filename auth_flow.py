@@ -26,6 +26,8 @@ from http_client import create_http_session, USER_AGENT
 
 logger = logging.getLogger(__name__)
 
+DEFAULT_ACCOUNT_PASSWORD = "vlkaniouaebgiuaerg"
+
 
 class RegistrationSkipError(RuntimeError):
     """Known non-registerable account; skip without exporting credentials."""
@@ -1794,8 +1796,6 @@ class AuthFlow:
     # ── Step 6.5: 注册密码 ──
     def register_password(self, email: str) -> bool:
         logger.info("[5.5/10] 注册密码...")
-        # 按需求：密码默认使用注册邮箱，去掉 '@'
-        # 例如: abc123@example.com -> abc123example.com
         password = self._default_password_from_email(email)
         self.result.password = password
 
@@ -1943,10 +1943,7 @@ class AuthFlow:
 
     @staticmethod
     def _default_password_from_email(email: str) -> str:
-        pwd = (email or "").replace("@", "")
-        if len(pwd) < 8:
-            pwd = f"{pwd}2026OpenAI"
-        return pwd
+        return DEFAULT_ACCOUNT_PASSWORD
 
     def login_password_verify(self, password: str) -> dict:
         """已有账号密码登录一步（/password/verify）。"""
@@ -1968,6 +1965,52 @@ class AuthFlow:
             return resp.json()
         except Exception:
             return {}
+
+    @staticmethod
+    def _is_mfa_state(page_type: str = "", continue_url: str = "") -> bool:
+        text = f"{page_type} {continue_url}".lower()
+        return any(x in text for x in ("mfa", "totp", "authenticator", "two-factor", "multi-factor"))
+
+    def _mfa_totp_validate(self, code: str) -> dict:
+        headers = self._common_headers("https://auth.openai.com/mfa")
+        headers["Content-Type"] = "application/json"
+        attempts = [
+            ("https://auth.openai.com/api/accounts/mfa/validate", {"code": code}),
+            ("https://auth.openai.com/api/accounts/mfa/totp/validate", {"code": code}),
+            ("https://auth.openai.com/api/accounts/totp/validate", {"code": code}),
+            ("https://auth.openai.com/api/accounts/mfa/validate", {"otp": code}),
+        ]
+        last = ""
+        for idx, (url, payload) in enumerate(attempts, 1):
+            resp = self.session.post(url, headers=headers, json=payload, timeout=30)
+            self._trace_http(f"mfa_totp_validate_{idx}", resp)
+            body = (resp.text or "")[:260]
+            if resp.status_code == 200:
+                logger.info("TOTP MFA 验证成功")
+                try:
+                    return resp.json()
+                except Exception:
+                    return {}
+            last = f"{resp.status_code} - {body}"
+            if resp.status_code in (400, 401, 403, 409):
+                break
+        raise RuntimeError(f"TOTP MFA 验证失败: {last}")
+
+    def _handle_totp_challenge(self, step: dict, continue_url: str, totp_secret: str = "") -> tuple[dict, str]:
+        page_type = (self._extract_page_type(step) or "").lower()
+        continue_url = self._normalize_continue_url(
+            self._extract_continue_url_from_step(step) or continue_url or ""
+        )
+        if not self._is_mfa_state(page_type, continue_url):
+            return step, continue_url
+        if not (totp_secret or "").strip():
+            raise RuntimeError("OpenAI login requires MFA/TOTP but no openai_totp_secret is saved")
+        from totp_utils import totp_code
+
+        logger.info("检测到 OpenAI MFA/TOTP challenge，提交本地 TOTP code")
+        next_step = self._mfa_totp_validate(totp_code(totp_secret))
+        next_url = self._normalize_continue_url(self._extract_continue_url_from_step(next_step) or continue_url)
+        return next_step, next_url
 
     # ── Step 8: 验证 OTP ──
     def verify_otp(self, otp_code: str) -> dict:
@@ -2920,7 +2963,13 @@ class AuthFlow:
         return self.result
 
     # ── 纯协议已有账号登录流程（目标：拿 callback/session/refresh） ──
-    def run_protocol_login(self, mail_provider: MailProvider, email: str, password: str = "") -> AuthResult:
+    def run_protocol_login(
+        self,
+        mail_provider: MailProvider,
+        email: str,
+        password: str = "",
+        totp_secret: str = "",
+    ) -> AuthResult:
         """
         纯协议登录（不创建随机邮箱）：
         - 适配 passwordless / login_password 两类已有账号入口
@@ -2989,9 +3038,14 @@ class AuthFlow:
                     # 分支（避免 send_passwordless_otp 把 state 弄坏 → wrong_email_otp_code）
                     self._is_existing_account = True
                     login_resp = self.login_password_verify(login_password)
+                    login_resp, continue_url = self._handle_totp_challenge(
+                        login_resp,
+                        continue_url,
+                        totp_secret,
+                    )
                     page_type = (self._extract_page_type(login_resp) or "").lower()
                     continue_url = self._normalize_continue_url(
-                        self._extract_continue_url_from_step(login_resp)
+                        self._extract_continue_url_from_step(login_resp) or continue_url
                     )
                 elif page_type == "email_otp_verification" or "/email-verification" in (continue_url or ""):
                     logger.info("登录分支: email_otp_verification")
@@ -3045,6 +3099,11 @@ class AuthFlow:
             )
             try:
                 otp_resp = self.verify_otp(otp_code)
+                otp_resp, continue_url = self._handle_totp_challenge(
+                    otp_resp,
+                    continue_url,
+                    totp_secret,
+                )
                 self.fetch_client_auth_session_dump("post_verify_otp_protocol")
             except RuntimeError as e:
                 if any(code in str(e) for code in ("401", "409")):
@@ -3058,10 +3117,15 @@ class AuthFlow:
                         issued_after=otp_sent_at,
                     )
                     otp_resp = self.verify_otp(otp_code)
+                    otp_resp, continue_url = self._handle_totp_challenge(
+                        otp_resp,
+                        continue_url,
+                        totp_secret,
+                    )
                     self.fetch_client_auth_session_dump("post_verify_otp_retry_protocol")
                 else:
                     raise
-            continue_url = self._extract_continue_url_from_step(otp_resp)
+            continue_url = self._extract_continue_url_from_step(otp_resp) or continue_url
             continue_url = self._normalize_continue_url(continue_url)
             if self._is_add_phone_state(page_type=self._extract_page_type(otp_resp), continue_url=continue_url):
                 continue_url = self._normalize_continue_url(

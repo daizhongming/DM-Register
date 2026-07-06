@@ -250,6 +250,48 @@ def test_paymesh_expired_session_blocks_reauth_capability():
         db.DB_PATH = old_db_path
 
 
+def test_delete_local_account_artifacts_cleans_paymesh_and_credentials():
+    old_db_path = db.DB_PATH
+    try:
+        with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+            db.DB_PATH = Path(tmp) / "webui.db"
+            db.init_db()
+            log_dir = db.DB_PATH.parent / "logs"
+            log_dir.mkdir()
+            log_path = log_dir / "run1.log"
+            log_path.write_text("secret-ish log", encoding="utf-8")
+
+            db.set_setting("paymesh_card_codes", "CARD-KEEP\nCARD-DROP")
+            db.mark_paymesh_card_done("CARD-DROP", "demo@example.com", "active")
+            db.save_registered({"email": "demo@example.com", "password": "pw", "refresh_token": "rt"})
+            db.import_accounts("demo@example.com----mailpw----client----" + ("r" * 24))
+            db.upsert_auth_resources(
+                "demo@example.com",
+                phone_number="+12025550123",
+                sms_activation_id="act-1",
+                openai_totp_secret="JBSWY3DPEHPK3PXP",
+            )
+            db.create_run("run1", "demo@example.com", str(log_path))
+            db.finish_run("run1", "done")
+
+            result = db.delete_local_account_artifacts("DEMO@example.com")
+
+            assert result["registered"] == 1
+            assert result["outlook"] == 1
+            assert result["auth_resources"] == 1
+            assert result["paymesh_pool"] == 1
+            assert result["paymesh_state"] == 1
+            assert result["runs"] == 1
+            assert result["run_logs"] == 1
+            assert db.get_registered("demo@example.com") is None
+            assert db.get_account("demo@example.com") is None
+            assert db.get_auth_resources("demo@example.com") == {"email": "demo@example.com"}
+            assert db.get_setting("paymesh_card_codes") == "CARD-KEEP"
+            assert not log_path.exists()
+    finally:
+        db.DB_PATH = old_db_path
+
+
 if __name__ == "__main__":
     test_paymesh_card_flow_and_state()
     test_paymesh_provider_redeem_lookup_and_otp()
@@ -260,4 +302,5 @@ if __name__ == "__main__":
     test_paymesh_rejects_non_email_card()
     test_paymesh_retry_failed_only_resets_failed_cards()
     test_paymesh_expired_session_blocks_reauth_capability()
+    test_delete_local_account_artifacts_cleans_paymesh_and_credentials()
     print("ok")

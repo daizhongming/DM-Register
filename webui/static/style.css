@@ -191,10 +191,41 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .result.ok { color: var(--ok); }
 .result.bad { color: var(--bad); }
 
+.k12-usable-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-top: 4px;
+  color: var(--pink-dark);
+  font-size: 13px;
+  font-weight: 600;
+}
+.k12-usable-head button {
+  padding: 5px 10px;
+  font-size: 12px;
+}
 .k12-usable-grid {
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
+  gap: 10px;
+  align-items: start;
+}
+.k12-usable-grid label {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 4px 8px;
+  min-width: 0;
+}
+.k12-usable-grid label small {
+  justify-self: end;
+  margin-left: 0;
+  white-space: nowrap;
+}
+.k12-usable-grid textarea {
+  grid-column: 1 / -1;
+  min-height: 88px;
+  resize: vertical;
 }
 @media (max-width: 900px) { .k12-usable-grid { grid-template-columns: 1fr; } }
 

@@ -82,6 +82,9 @@ def init_db():
             mail_source             TEXT,
             paymesh_card_code       TEXT,
             paymesh_session_status  TEXT,
+            openai_totp_secret      TEXT,
+            openai_mfa_status       TEXT,
+            openai_mfa_recovery_codes TEXT,
             sms_provider            TEXT,
             sms_service             TEXT,
             sms_country             TEXT,
@@ -102,6 +105,12 @@ def init_db():
     if "error_category" not in cols:
         con.execute("ALTER TABLE runs ADD COLUMN error_category TEXT")
         con.commit()
+    cur = con.execute("PRAGMA table_info(account_auth_resources)")
+    cols = {r[1] for r in cur.fetchall()}
+    for col in ("openai_totp_secret", "openai_mfa_status", "openai_mfa_recovery_codes"):
+        if col not in cols:
+            con.execute(f"ALTER TABLE account_auth_resources ADD COLUMN {col} TEXT")
+    con.commit()
 
 
 # ──────────────────────── outlook 号池 ────────────────────────
@@ -528,6 +537,113 @@ def delete_all_registered() -> int:
         return rc.rowcount
 
 
+def _delete_run_log_files(paths: list[str]) -> tuple[int, int]:
+    base = (DB_PATH.parent / "logs").resolve()
+    deleted = failed = 0
+    for raw in paths:
+        if not raw:
+            continue
+        try:
+            path = Path(raw)
+            if not path.is_absolute():
+                path = DB_PATH.parent / path
+            path = path.resolve()
+            if base != path.parent and base not in path.parents:
+                failed += 1
+                continue
+            if path.exists() and path.is_file():
+                path.unlink()
+                deleted += 1
+        except Exception:
+            failed += 1
+    return deleted, failed
+
+
+def delete_local_account_artifacts(email: str) -> dict:
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        return {"email": email, "deleted": 0}
+
+    with _lock:
+        con = _conn()
+        paymesh_codes: set[str] = set()
+        row = con.execute(
+            "SELECT paymesh_card_code FROM account_auth_resources WHERE email=?",
+            (email,),
+        ).fetchone()
+        if row and row["paymesh_card_code"]:
+            paymesh_codes.add(str(row["paymesh_card_code"]).strip())
+
+        state = _read_paymesh_card_state(con)
+        for code, rec in list(state.items()):
+            if (dict(rec or {}).get("email") or "").strip().lower() == email:
+                paymesh_codes.add(code)
+
+        paymesh_state_deleted = 0
+        for code in list(paymesh_codes):
+            if code in state:
+                del state[code]
+                paymesh_state_deleted += 1
+
+        codes = parse_paymesh_card_codes(_get_setting_con(con, "paymesh_card_codes", ""))
+        kept_codes = [code for code in codes if code not in paymesh_codes]
+        paymesh_pool_deleted = len(codes) - len(kept_codes)
+        if paymesh_pool_deleted:
+            con.execute(
+                "INSERT INTO settings(key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                ("paymesh_card_codes", "\n".join(kept_codes)),
+            )
+        if paymesh_state_deleted:
+            _write_paymesh_card_state(con, state)
+
+        registered_deleted = con.execute(
+            "DELETE FROM registered WHERE email=?",
+            (email,),
+        ).rowcount
+        outlook_deleted = con.execute(
+            "DELETE FROM outlook_accounts WHERE email=?",
+            (email,),
+        ).rowcount
+        auth_resources_deleted = con.execute(
+            "DELETE FROM account_auth_resources WHERE email=?",
+            (email,),
+        ).rowcount
+
+        run_rows = con.execute(
+            "SELECT log_path FROM runs WHERE email=? AND status!='running'",
+            (email,),
+        ).fetchall()
+        runs_deleted = con.execute(
+            "DELETE FROM runs WHERE email=? AND status!='running'",
+            (email,),
+        ).rowcount
+        con.commit()
+
+    logs_deleted, logs_failed = _delete_run_log_files([r["log_path"] for r in run_rows])
+    deleted = (
+        registered_deleted
+        + outlook_deleted
+        + auth_resources_deleted
+        + paymesh_pool_deleted
+        + paymesh_state_deleted
+        + runs_deleted
+        + logs_deleted
+    )
+    return {
+        "email": email,
+        "deleted": deleted,
+        "registered": registered_deleted,
+        "outlook": outlook_deleted,
+        "auth_resources": auth_resources_deleted,
+        "paymesh_pool": paymesh_pool_deleted,
+        "paymesh_state": paymesh_state_deleted,
+        "runs": runs_deleted,
+        "run_logs": logs_deleted,
+        "run_logs_failed": logs_failed,
+    }
+
+
 # ──────────────────────── 运行记录 ────────────────────────
 
 
@@ -645,6 +761,9 @@ _AUTH_RESOURCE_FIELDS = {
     "mail_source",
     "paymesh_card_code",
     "paymesh_session_status",
+    "openai_totp_secret",
+    "openai_mfa_status",
+    "openai_mfa_recovery_codes",
     "sms_provider",
     "sms_service",
     "sms_country",
@@ -681,6 +800,26 @@ def upsert_auth_resources(email: str, **fields) -> None:
         con = _conn()
         _upsert_auth_resources_con(con, email, **fields)
         con.commit()
+
+
+def save_openai_totp(email: str, secret: str, recovery_codes: str = "", status: str = "totp_secret_saved") -> dict:
+    from totp_utils import normalize_totp_secret
+
+    email = (email or "").strip().lower()
+    if not email or "@" not in email:
+        raise ValueError("invalid account email")
+    clean_secret = normalize_totp_secret(secret)
+    with _lock:
+        con = _conn()
+        _upsert_auth_resources_con(
+            con,
+            email,
+            openai_totp_secret=clean_secret,
+            openai_mfa_status=(status or "totp_secret_saved").strip(),
+            openai_mfa_recovery_codes=(recovery_codes or "").strip(),
+        )
+        con.commit()
+    return get_auth_resources(email)
 
 
 def _get_paymesh_card_by_email_con(con: sqlite3.Connection, email: str) -> Optional[dict]:
@@ -750,6 +889,16 @@ def _safe_auth_resources(resources: dict) -> dict:
     code = safe.pop("paymesh_card_code", "")
     if code and not safe.get("paymesh_card"):
         safe["paymesh_card"] = _mask_paymesh_card(code)
+    totp_secret = safe.pop("openai_totp_secret", "")
+    if totp_secret:
+        from totp_utils import mask_totp_secret
+
+        safe["openai_totp_secret_set"] = True
+        safe["openai_totp_secret_masked"] = mask_totp_secret(totp_secret)
+    else:
+        safe["openai_totp_secret_set"] = False
+    recovery = safe.pop("openai_mfa_recovery_codes", "")
+    safe["openai_mfa_recovery_codes_set"] = bool(recovery)
     return safe
 
 
@@ -763,6 +912,8 @@ def describe_reauth_capability(email: str, ignore_registered_rt: bool = False) -
     blockers: list[str] = []
     warnings: list[str] = []
     method = ""
+    has_totp = bool((resources.get("openai_totp_secret") or "").strip())
+    has_password = bool((registered or {}).get("password"))
 
     if not email:
         blockers.append("missing_email")
@@ -772,7 +923,14 @@ def describe_reauth_capability(email: str, ignore_registered_rt: bool = False) -
         mail_source = (resources.get("mail_source") or "").strip()
         if outlook:
             mail_source = "outlook"
-        if mail_source == "outlook":
+        if has_totp and has_password:
+            method = "openai_totp_protocol_login"
+            if not sms_ready:
+                warnings.append("sms_not_configured")
+            if not (resources.get("phone_number") or "").strip():
+                warnings.append("no_saved_phone")
+            warnings.append("email_otp_may_still_be_required")
+        elif mail_source == "outlook":
             method = "outlook_protocol_login"
         elif mail_source == "paymesh_card" and resources.get("paymesh_card_code"):
             method = "paymesh_card_protocol_login"
@@ -794,6 +952,8 @@ def describe_reauth_capability(email: str, ignore_registered_rt: bool = False) -
                 warnings.append("no_saved_phone")
             if not (registered or {}).get("password"):
                 warnings.append("password_missing")
+            if (resources.get("openai_totp_secret") or "").strip():
+                warnings.append("totp_available_but_email_fallback_still_required")
 
     safe_resources = _safe_auth_resources(resources)
     if outlook and not safe_resources.get("mail_source"):
@@ -809,6 +969,7 @@ def describe_reauth_capability(email: str, ignore_registered_rt: bool = False) -
         "has_registered": bool(registered),
         "has_registered_rt": bool((registered or {}).get("refresh_token")),
         "has_outlook": bool(outlook),
+        "has_openai_totp": has_totp,
         "sms_available": sms_ready,
     }
 

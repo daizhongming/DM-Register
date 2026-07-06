@@ -26,6 +26,16 @@ class ReauthCancelled(Exception):
     pass
 
 
+class TotpOnlyMailProvider:
+    """MailProvider stub for password+TOTP attempts without mailbox access."""
+
+    def create_mailbox(self) -> str:
+        return ""
+
+    def wait_for_otp(self, email: str, timeout: int = 180, issued_after: float = 0) -> str:
+        raise RuntimeError(f"email OTP required for {email}; TOTP did not bypass mailbox verification")
+
+
 def _check_cancel(cancel_check: Optional[Callable[[], bool]]) -> None:
     if cancel_check and cancel_check():
         raise ReauthCancelled("cancelled")
@@ -405,7 +415,11 @@ def _apply_fresh_credentials(account: dict, cfg: dict, fresh: dict, log_fn: Opti
     return {"ok": True, "account_id": account_id, "email": email, "updated": updated}
 
 
-def delete_sub2api_accounts(account_ids: list[int], log_fn: Optional[LogFn] = None) -> dict:
+def delete_sub2api_accounts(
+    account_ids: list[int],
+    log_fn: Optional[LogFn] = None,
+    account_emails: Optional[dict[int, str]] = None,
+) -> dict:
     clean: list[int] = []
     seen: set[int] = set()
     for value in account_ids or []:
@@ -423,21 +437,58 @@ def delete_sub2api_accounts(account_ids: list[int], log_fn: Optional[LogFn] = No
     timeout = int(cfg.get("sub2api_timeout") or exporter.DEFAULT_TIMEOUT)
     cffi = exporter._import_cffi()
     results: list[dict] = []
+    email_by_id: dict[int, str] = {}
+    for key, value in (account_emails or {}).items():
+        email = str(value or "").strip().lower()
+        if not email:
+            continue
+        try:
+            email_by_id[int(key)] = email
+        except Exception:
+            continue
+    try:
+        for account in list_sub2api_openai_oauth_accounts(cfg, scan_limit=1000, log_fn=log_fn):
+            account_id = int(account.get("id") or 0)
+            if account_id in seen:
+                email = _email_from_account(account)
+                if email:
+                    email_by_id[account_id] = email
+    except Exception as e:
+        _log(log_fn, f"[SUB2API] account email lookup failed before delete: {e}", "warn")
 
     for account_id in clean:
         try:
             _sub2api_delete(cffi, api_url, api_key, f"/admin/accounts/{account_id}", timeout)
             _log(log_fn, f"[SUB2API] deleted account #{account_id}", "info")
-            results.append({"account_id": account_id, "ok": True})
+            result = {
+                "account_id": account_id,
+                "ok": True,
+                "remote_deleted": True,
+                "email": email_by_id.get(account_id, ""),
+            }
+            if result["email"]:
+                try:
+                    result["local_cleanup"] = db.delete_local_account_artifacts(result["email"])
+                    _log(log_fn, f"[local] cleaned artifacts for {result['email']}", "info")
+                except Exception as e:
+                    result["local_cleanup_error"] = str(e)
+                    _log(log_fn, f"[local] cleanup failed for {result['email']}: {e}", "warn")
+            else:
+                result["local_cleanup_error"] = "email_not_found"
+            results.append(result)
         except Exception as e:
             _log(log_fn, f"[SUB2API] delete failed #{account_id}: {e}", "warn")
-            results.append({"account_id": account_id, "ok": False, "error": str(e)})
+            results.append({"account_id": account_id, "ok": False, "remote_deleted": False, "error": str(e)})
 
     deleted = sum(1 for r in results if r.get("ok"))
+    local_failed = sum(1 for r in results if r.get("ok") and r.get("local_cleanup_error"))
     return {
         "requested": len(clean),
         "deleted": deleted,
         "failed": len(clean) - deleted,
+        "local_deleted": sum(1 for r in results if r.get("local_cleanup")),
+        "local_artifacts_deleted": sum((r.get("local_cleanup") or {}).get("deleted", 0) for r in results),
+        "local_failed": local_failed,
         "results": results,
     }
 
@@ -494,6 +545,8 @@ def _record_reauth_resources(email: str, method: str, sms_callback=None, error: 
         fields["mail_source"] = "paymesh_card"
     elif method.startswith("cf_temp_"):
         fields["mail_source"] = "cf_temp"
+    elif method.startswith("openai_totp_"):
+        fields["openai_mfa_status"] = "failed" if error else "totp_login_ok"
     fields.update(_sms_resource_fields(sms_callback))
     db.upsert_auth_resources(email, **fields)
 
@@ -517,6 +570,8 @@ def _protocol_mail_provider(email: str, method: str, proxy: str):
         if not code:
             raise RuntimeError(f"no PayMesh card mapped for {email}")
         return PayMeshCardEmailProvider(proxy=proxy or "", card_code=code, email=email)
+    if method == "openai_totp_protocol_login":
+        return TotpOnlyMailProvider()
     if method == "cf_temp_protocol_login":
         from mail_cf import CFTempEmailProvider
 
@@ -553,13 +608,16 @@ def _reauthorize_one(
     capability = db.describe_reauth_capability(email, ignore_registered_rt=True)
     method = capability.get("reauth_method_hint") or ""
     resources = capability.get("auth_resources") or {}
+    raw_resources = db.get_auth_resources(email)
     _log(
         log_fn,
         "[reauth] resources #%s %s mail=%s card=%s sms=%s ready=%s method=%s blockers=%s"
         % (
             account_id,
             email,
-            resources.get("mail_source") or ("outlook" if capability.get("has_outlook") else "-"),
+            "totp" if method == "openai_totp_protocol_login" else (
+                resources.get("mail_source") or ("outlook" if capability.get("has_outlook") else "-")
+            ),
             resources.get("paymesh_card") or "-",
             resources.get("sms_provider") or "-",
             capability.get("sms_available"),
@@ -577,13 +635,22 @@ def _reauthorize_one(
     cfg_flow.proxy = (proxy or "").strip() or None
     mail = _protocol_mail_provider(email, method, proxy)
     flow = AuthFlow(cfg_flow, sms_callback=sms_callback)
+    if sms_callback is not None and hasattr(sms_callback, "set_preferred_activation"):
+        sms_callback.set_preferred_activation(
+            raw_resources.get("sms_activation_id") or resources.get("sms_activation_id") or "",
+            raw_resources.get("phone_number") or resources.get("phone_number") or "",
+        )
     registered = db.get_registered(email) or {}
     with _patched_env({
         "OTP_TIMEOUT": str(max(30, int(otp_timeout or 180))),
         "OAUTH_CODEX_RT_EXCHANGE": "1",
         "OAUTH_CODEX_RT_BEFORE_CALLBACK": "1",
     }):
-        result = flow.run_protocol_login(mail, email, registered.get("password", ""))
+        totp_secret = (raw_resources.get("openai_totp_secret") or "").strip()
+        if totp_secret:
+            result = flow.run_protocol_login(mail, email, registered.get("password", ""), totp_secret=totp_secret)
+        else:
+            result = flow.run_protocol_login(mail, email, registered.get("password", ""))
 
     fresh = result.to_dict()
     fresh["email"] = email
