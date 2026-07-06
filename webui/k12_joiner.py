@@ -160,6 +160,7 @@ def join_workspaces_from_config(
     proxy: Optional[str] = None,
     session_token: Optional[str] = None,
     allow_personal_token: bool = False,
+    workspace_ids_override: Optional[list[str]] = None,
 ) -> dict:
     """从数据库配置读取 workspace IDs 并批量加入。
 
@@ -182,11 +183,15 @@ def join_workspaces_from_config(
         logger.debug("K12 加入功能未启用，跳过")
         return {"total": 0, "success": 0, "failed": 0, "attempted": 0, "skipped": 0, "joined_workspace_ids": []}
 
-    workspace_ids_text = db.get_setting("k12_workspace_ids", "")
+    if workspace_ids_override is None:
+        workspace_ids_text = db.get_setting("k12_workspace_ids", "")
+        workspace_rows = workspace_ids_text.splitlines()
+    else:
+        workspace_rows = workspace_ids_override
     workspace_ids = [
-        line.strip()
-        for line in workspace_ids_text.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+        str(line).strip()
+        for line in workspace_rows
+        if str(line).strip() and not str(line).strip().startswith("#")
     ]
 
     if not workspace_ids:

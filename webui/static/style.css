@@ -143,6 +143,7 @@ textarea, input, select {
   color: var(--text);
 }
 textarea { resize: vertical; font-size: 12px; }
+textarea[readonly] { background: #fffafc; color: var(--muted); }
 
 textarea:focus, input:focus, select:focus {
   outline: none;
@@ -189,6 +190,13 @@ button:disabled { opacity: 0.5; cursor: not-allowed; }
 .result { color: var(--muted); font-size: 12px; }
 .result.ok { color: var(--ok); }
 .result.bad { color: var(--bad); }
+
+.k12-usable-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 8px;
+}
+@media (max-width: 900px) { .k12-usable-grid { grid-template-columns: 1fr; } }
 
 .paymesh-pools {
   display: grid;

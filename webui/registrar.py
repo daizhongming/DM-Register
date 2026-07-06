@@ -294,7 +294,7 @@ def _do_register(
             db.mark_done(email)
 
         # K12 must run before SUB2API workspace export so we know every joined workspace.
-        k12_result = _try_join_k12_workspaces(run_id, d, cfg.proxy)
+        k12_result = _try_join_k12_workspaces(run_id, d, cfg.proxy, mail_source)
         k12_enabled = db.get_setting("k12_enabled", "0") == "1"
         joined_workspace_ids = [
             str(ws_id).strip()
@@ -304,7 +304,13 @@ def _do_register(
 
         _try_export_to_panels(run_id, d, include_sub2api=not k12_enabled)
         if joined_workspace_ids:
-            _try_export_joined_workspaces_to_sub2api(run_id, d, k12_result or {}, auth_flow=flow)
+            _try_export_joined_workspaces_to_sub2api(
+                run_id,
+                d,
+                k12_result or {},
+                auth_flow=flow,
+                mail_source=mail_source,
+            )
         elif k12_enabled:
             logging.getLogger("registrar").info("[sub2api] no joined K12 workspaces to export")
 
@@ -438,6 +444,7 @@ def _try_export_joined_workspaces_to_sub2api(
     cred: dict,
     k12_result: dict,
     auth_flow: Optional[AuthFlow] = None,
+    mail_source: str = "outlook",
 ) -> None:
     seen: set[str] = set()
     joined_workspace_ids: list[str] = []
@@ -475,6 +482,7 @@ def _try_export_joined_workspaces_to_sub2api(
 
     email = str(cred.get("email") or "").strip()
     ok_count = 0
+    exported_workspace_ids: list[str] = []
     failed: list[str] = []
     workspace_accounts = k12_result.get("workspace_accounts") or {}
     workspace_accounts = workspace_accounts if isinstance(workspace_accounts, dict) else {}
@@ -565,8 +573,19 @@ def _try_export_joined_workspaces_to_sub2api(
             result = {"ok": False, "error": str(e)}
         if result.get("ok"):
             ok_count += 1
+            exported_workspace_ids.append(ws_id)
         else:
             failed.append(f"{ws_id[:8]}: {result.get('error') or result.get('message') or 'unknown error'}")
+
+    if exported_workspace_ids:
+        try:
+            saved = db.add_k12_usable_workspace_ids(mail_source, exported_workspace_ids)
+            _log(
+                f"saved {len(exported_workspace_ids)} usable workspace id(s) for {mail_source}; total {len(saved)}",
+                "info",
+            )
+        except Exception as e:
+            _log(f"save usable workspace ids failed: {e}", "warn")
 
     level = "info" if not failed else "warn"
     _log(
@@ -585,7 +604,7 @@ def _try_export_joined_workspaces_to_sub2api(
         pass
 
 
-def _try_join_k12_workspaces(run_id: str, cred: dict, proxy: Optional[str]) -> Optional[dict]:
+def _try_join_k12_workspaces(run_id: str, cred: dict, proxy: Optional[str], mail_source: str = "outlook") -> Optional[dict]:
     """注册完成后可选地加入 K12 Workspace。
 
     - 开关关闭时跳过（不发请求）
@@ -631,11 +650,15 @@ def _try_join_k12_workspaces(run_id: str, cred: dict, proxy: Optional[str]) -> O
 
     try:
         _log("开始 K12 Workspace 加入流程")
+        usable_workspace_ids = db.get_k12_usable_workspace_ids(mail_source)
+        if usable_workspace_ids:
+            _log(f"using {len(usable_workspace_ids)} saved usable workspace id(s) for {mail_source}")
         result = k12_joiner.join_workspaces_from_config(
             access_token,
             proxy=proxy,
             session_token=session_token,
             allow_personal_token=bool(cred.get("created_new") or cred.get("login_mode")),
+            workspace_ids_override=usable_workspace_ids or None,
         )
 
         if result["total"] > 0:

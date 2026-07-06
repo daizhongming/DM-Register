@@ -1466,10 +1466,52 @@ async function loadK12Config() {
     const { config } = await api("/api/settings/k12");
     $("#k12Enabled").checked = config.k12_enabled === "1";
     $("#k12WorkspaceIds").value = config.k12_workspace_ids || "";
+    renderK12UsableWorkspaces(config.k12_usable_workspace_ids_by_mail_source || {});
   } catch (e) {
     console.error("loadK12Config:", e);
   }
 }
+
+function renderK12UsableWorkspaces(groups) {
+  const targets = [
+    ["outlook", "#k12UsableOutlook", "#k12UsableOutlookCount"],
+    ["cf_temp", "#k12UsableCfTemp", "#k12UsableCfTempCount"],
+    ["paymesh_card", "#k12UsablePaymesh", "#k12UsablePaymeshCount"],
+  ];
+  for (const [key, textareaSel, countSel] of targets) {
+    const rows = Array.isArray(groups[key]) ? groups[key] : [];
+    $(textareaSel).value = rows.join("\n");
+    $(countSel).textContent = `${rows.length} 个`;
+  }
+}
+
+function dedupeK12WorkspaceIds() {
+  const input = $("#k12WorkspaceIds");
+  const result = $("#k12TestResult");
+  const seen = new Set();
+  const out = [];
+  let removed = 0;
+  for (const raw of input.value.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (!line) continue;
+    if (line.startsWith("#")) {
+      out.push(line);
+      continue;
+    }
+    const key = line.toLowerCase();
+    if (seen.has(key)) {
+      removed += 1;
+      continue;
+    }
+    seen.add(key);
+    out.push(key);
+  }
+  input.value = out.join("\n");
+  result.textContent = removed ? `已移除 ${removed} 个重复 Workspace ID` : "没有重复 Workspace ID";
+  result.className = "result ok";
+}
+
+$("#btnDedupeK12").addEventListener("click", dedupeK12WorkspaceIds);
 
 $("#btnSaveExportCfg").addEventListener("click", async () => {
   const cpaKeyInput = $("#cpaMgmtKey").value.trim();

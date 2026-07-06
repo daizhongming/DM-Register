@@ -644,6 +644,7 @@ def api_get_k12_config():
         "config": {
             "k12_enabled": db.get_setting("k12_enabled", "0"),
             "k12_workspace_ids": db.get_setting("k12_workspace_ids", ""),
+            "k12_usable_workspace_ids_by_mail_source": db.get_k12_usable_workspace_ids_by_mail_source(),
         }
     }
 
@@ -660,6 +661,7 @@ def api_save_k12_config(req: SaveK12ConfigReq):
         "config": {
             "k12_enabled": db.get_setting("k12_enabled", "0"),
             "k12_workspace_ids": db.get_setting("k12_workspace_ids", ""),
+            "k12_usable_workspace_ids_by_mail_source": db.get_k12_usable_workspace_ids_by_mail_source(),
         }
     }
 

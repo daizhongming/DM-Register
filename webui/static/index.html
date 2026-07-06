@@ -4,7 +4,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>DM Register WebUI</title>
-<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/style.css?v=k12-usable-1">
 </head>
 <body>
 
@@ -458,6 +458,18 @@
             <textarea id="k12WorkspaceIds" rows="5" placeholder="acfb4e38-524c-4dc8-b4cf-fb3d0ce28b25&#10;# 这是注释行，会被忽略&#10;另一个workspace-id"></textarea>
           </label>
 
+          <div class="k12-usable-grid">
+            <label>Outlook 可用 Workspace IDs <small id="k12UsableOutlookCount">0 个</small>
+              <textarea id="k12UsableOutlook" rows="3" readonly></textarea>
+            </label>
+            <label>CF Temp 可用 Workspace IDs <small id="k12UsableCfTempCount">0 个</small>
+              <textarea id="k12UsableCfTemp" rows="3" readonly></textarea>
+            </label>
+            <label>PayMesh 卡密邮箱可用 Workspace IDs <small id="k12UsablePaymeshCount">0 个</small>
+              <textarea id="k12UsablePaymesh" rows="3" readonly></textarea>
+            </label>
+          </div>
+
           <p class="hint">
             ⚠️ K12 workspace 加入不需要接码、不需要 refresh_token，只需注册成功后的 access_token。<br>
             加入失败不会影响注册流程，只记录日志。
@@ -465,6 +477,7 @@
 
           <div class="row">
             <button id="btnTestK12">🔌 测试 Workspace ID 格式</button>
+            <button id="btnDedupeK12">去重 Workspace IDs</button>
             <span id="k12TestResult" class="result"></span>
           </div>
         </fieldset>
@@ -491,6 +504,6 @@
   </div>
 </div>
 
-<script src="/static/app.js?v=sub2api-cancel-1"></script>
+<script src="/static/app.js?v=k12-usable-1"></script>
 </body>
 </html>

@@ -15,7 +15,9 @@ from typing import Optional
 
 DB_PATH = Path(__file__).resolve().parent / "webui.db"
 K12_WORKSPACE_FAILURES_KEY = "k12_workspace_failures"
+K12_USABLE_WORKSPACES_KEY = "k12_usable_workspace_ids_by_mail_source"
 PAYMESH_CARD_STATE_KEY = "paymesh_card_state"
+MAIL_SOURCES = ("outlook", "cf_temp", "paymesh_card")
 
 _lock = threading.Lock()  # SQLite 写入串行化
 
@@ -586,6 +588,57 @@ def set_setting(key: str, value) -> None:
 
 
 # ──────────────────────── 邮箱来源配置 ────────────────────────
+
+
+def _normalize_mail_source(mail_source: str) -> str:
+    mail_source = str(mail_source or "").strip().lower()
+    return mail_source if mail_source in MAIL_SOURCES else "outlook"
+
+
+def _dedupe_workspace_ids(value) -> list[str]:
+    rows = value.splitlines() if isinstance(value, str) else (value or [])
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in rows:
+        ws_id = str(item or "").strip().lower()
+        if not ws_id or ws_id.startswith("#") or ws_id in seen:
+            continue
+        seen.add(ws_id)
+        out.append(ws_id)
+    return out
+
+
+def _parse_k12_usable_workspaces(raw: str) -> dict[str, list[str]]:
+    try:
+        data = json.loads(raw) if raw else {}
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    return {source: _dedupe_workspace_ids(data.get(source, [])) for source in MAIL_SOURCES}
+
+
+def get_k12_usable_workspace_ids_by_mail_source() -> dict[str, list[str]]:
+    return _parse_k12_usable_workspaces(get_setting(K12_USABLE_WORKSPACES_KEY, ""))
+
+
+def get_k12_usable_workspace_ids(mail_source: str) -> list[str]:
+    return get_k12_usable_workspace_ids_by_mail_source()[_normalize_mail_source(mail_source)]
+
+
+def add_k12_usable_workspace_ids(mail_source: str, workspace_ids) -> list[str]:
+    source = _normalize_mail_source(mail_source)
+    with _lock:
+        con = _conn()
+        data = _parse_k12_usable_workspaces(_get_setting_con(con, K12_USABLE_WORKSPACES_KEY, ""))
+        data[source] = _dedupe_workspace_ids(data[source] + _dedupe_workspace_ids(workspace_ids))
+        con.execute(
+            "INSERT INTO settings(key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            (K12_USABLE_WORKSPACES_KEY, json.dumps(data, ensure_ascii=False)),
+        )
+        con.commit()
+    return data[source]
 
 
 _AUTH_RESOURCE_FIELDS = {
